@@ -18,15 +18,21 @@
 #include "lwip/dns.h"            // Biblioteca que fornece funções e recursos suporte DNS:
 #include "lwip/altcp_tls.h"      // Biblioteca que fornece funções e recursos para conexões seguras usando TLS:
 
-#define WIFI_SSID ""                // Substitua pelo nome da sua rede Wi-Fi
-#define WIFI_PASSWORD ""            // Substitua pela senha da sua rede Wi-Fi
-#define MQTT_SERVER "192.168.15.40" // Substitua pelo endereço do host - broket MQTT: Ex: 192.168.1.107
-#define MQTT_USERNAME ""            // Substitua pelo nome da host MQTT - Username
-#define MQTT_PASSWORD ""            // Substitua pelo Password da host MQTT - credencial de acesso - caso exista
+#define WIFI_SSID ""     // Substitua pelo nome da sua rede Wi-Fi
+#define WIFI_PASSWORD "" // Substitua pela senha da sua rede Wi-Fi
+#define MQTT_SERVER ""   // Substitua pelo endereço do host - broket MQTT: Ex: 192.168.1.107
+#define MQTT_USERNAME "" // Substitua pelo nome da host MQTT - Username
+#define MQTT_PASSWORD "" // Substitua pelo Password da host MQTT - credencial de acesso - caso exista
 
 #define LED_GREEN_PIN 11 // GPIO11 - LED verde
 #define LED_BLUE_PIN 12  // GPIO12 - LED azul
 #define LED_RED_PIN 13   // GPIO13 - LED vermelho
+
+// Definição dos pinos do joystick para simulação de umidade e qualidade do ar
+#define VRX 26
+#define VRY 27
+#define ADC_CHANNEL_0 0
+#define ADC_CHANNEL_1 1
 
 // Definição da escala de temperatura
 #ifndef TEMPERATURE_UNITS
@@ -59,6 +65,13 @@ typedef struct
     int subscribe_count;
     bool stop_client;
 } MQTT_CLIENT_DATA_T;
+
+// Dados do sensor simulado
+typedef struct
+{
+    uint16_t umidade;         // Simulado pelo eixo Y do joystick (0-100%)
+    uint16_t qualidade_do_ar; // Simulado pelo eixo X do joystick (0-100%)
+} SENSOR_DATA_T;
 
 #ifndef DEBUG_printf
 #ifndef NDEBUG
@@ -111,6 +124,9 @@ typedef struct
 // Leitura de temperatura do microcotrolador
 static float read_onboard_temperature(const char unit);
 
+// Leitura dos sensores do joystick
+static SENSOR_DATA_T read_joystick_sensors(void);
+
 // Requisição para publicar
 static void pub_request_cb(__unused void *arg, err_t err);
 
@@ -132,6 +148,9 @@ static void control_led_red(MQTT_CLIENT_DATA_T *state, bool on);
 // Publicar temperatura
 static void publish_temperature(MQTT_CLIENT_DATA_T *state);
 
+// Publicar umidade e qualidade do ar
+static void publish_humidity_and_air_quality(MQTT_CLIENT_DATA_T *state);
+
 // Requisição de Assinatura - subscribe
 static void sub_request_cb(void *arg, err_t err);
 
@@ -150,6 +169,10 @@ static void mqtt_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len
 // Publicar temperatura
 static void temperature_worker_fn(async_context_t *context, async_at_time_worker_t *worker);
 static async_at_time_worker_t temperature_worker = {.do_work = temperature_worker_fn};
+
+// Publicar umidade e qualidade do ar
+static void humidity_and_air_quality_worker_fn(async_context_t *context, async_at_time_worker_t *worker);
+static async_at_time_worker_t humidity_and_air_quality_worker = {.do_work = humidity_and_air_quality_worker_fn};
 
 // Conexão MQTT
 static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection_status_t status);
@@ -170,7 +193,8 @@ int main(void)
     // Inicializa o conversor ADC
     adc_init();
     adc_set_temp_sensor_enabled(true);
-    adc_select_input(4);
+    adc_gpio_init(VRX);
+    adc_gpio_init(VRY);
 
     // Configuração dos LEDs como saída
     gpio_init(LED_BLUE_PIN);
@@ -285,6 +309,7 @@ static float read_onboard_temperature(const char unit)
     /* 12-bit conversion, assume max value == ADC_VREF == 3.3 V */
     const float conversionFactor = 3.3f / (1 << 12);
 
+    adc_select_input(4); // Seleciona o canal ADC 4 para o sensor de temperatura integrado
     float adc = (float)adc_read() * conversionFactor;
     float tempC = 27.0f - (adc - 0.706f) / 0.001721f;
 
@@ -298,6 +323,21 @@ static float read_onboard_temperature(const char unit)
     }
 
     return -1.0f;
+}
+
+static SENSOR_DATA_T read_joystick_sensors(void)
+{
+    SENSOR_DATA_T sensorData;
+
+    // Lê eixo Y (nivel de umidade) - convertido para 0-100%
+    adc_select_input(ADC_CHANNEL_1); // VRY
+    sensorData.umidade = (adc_read() * 100) / 4095;
+
+    // Lê eixo X (volume de qualidade do ar) - convertido para ppm
+    adc_select_input(ADC_CHANNEL_0); // VRX
+    sensorData.qualidade_do_ar = (adc_read() * 2000) / 4095;
+
+    return sensorData;
 }
 
 // Requisição para publicar
@@ -371,6 +411,32 @@ static void control_led_red(MQTT_CLIENT_DATA_T *state, bool on)
         gpio_put(LED_RED_PIN, 0);
 
     mqtt_publish(state->mqtt_client_inst, full_topic(state, "/red_led/state"), message, strlen(message), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+}
+
+// Joystick simula leitura de sensores e publica dados de umidade e qualidade do ar
+void publish_humidity_and_air_quality(MQTT_CLIENT_DATA_T *state)
+{
+    static SENSOR_DATA_T old_sensor_data;
+    const char *humidity_key = full_topic(state, "/humidity");
+    const char *air_quality_key = full_topic(state, "/air_quality");
+    SENSOR_DATA_T new_sensor_data = read_joystick_sensors();
+
+    if (new_sensor_data.umidade != old_sensor_data.umidade || new_sensor_data.qualidade_do_ar != old_sensor_data.qualidade_do_ar)
+    {
+        old_sensor_data = new_sensor_data;
+
+        // Publish humidity on /humidity topic
+        char humidity_str[16];
+        snprintf(humidity_str, sizeof(humidity_str), "%u", new_sensor_data.umidade);
+        INFO_printf("Publishing %s to %s\n", humidity_str, humidity_key);
+        mqtt_publish(state->mqtt_client_inst, humidity_key, humidity_str, strlen(humidity_str), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+
+        // Publish air quality on /air_quality topic
+        char air_quality_str[16];
+        snprintf(air_quality_str, sizeof(air_quality_str), "%u", new_sensor_data.qualidade_do_ar);
+        INFO_printf("Publishing %s to %s\n", air_quality_str, air_quality_key);
+        mqtt_publish(state->mqtt_client_inst, air_quality_key, air_quality_str, strlen(air_quality_str), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+    }
 }
 
 // Publicar temperatura
@@ -506,6 +572,13 @@ static void temperature_worker_fn(async_context_t *context, async_at_time_worker
     async_context_add_at_time_worker_in_ms(context, worker, TEMP_WORKER_TIME_S * 1000);
 }
 
+static void humidity_and_air_quality_worker_fn(async_context_t *context, async_at_time_worker_t *worker)
+{
+    MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T *)worker->user_data;
+    publish_humidity_and_air_quality(state);
+    async_context_add_at_time_worker_in_ms(context, worker, 2500); // Run every two and a half seconds
+}
+
 // Conexão MQTT
 static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection_status_t status)
 {
@@ -524,6 +597,10 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
         // Publish temperature every 10 sec if it's changed
         temperature_worker.user_data = state;
         async_context_add_at_time_worker_in_ms(cyw43_arch_async_context(), &temperature_worker, 0);
+
+        // Publish humidity and air quality every second
+        humidity_and_air_quality_worker.user_data = state;
+        async_context_add_at_time_worker_in_ms(cyw43_arch_async_context(), &humidity_and_air_quality_worker, 0);
     }
     else if (status == MQTT_CONNECT_DISCONNECTED)
     {
