@@ -12,21 +12,43 @@
 #include "hardware/gpio.h" // Biblioteca de hardware de GPIO
 #include "hardware/irq.h"  // Biblioteca de hardware de interrupções
 #include "hardware/adc.h"  // Biblioteca de hardware para conversão ADC
+#include "hardware/pwm.h"  // Biblioteca de hardware para controle de PWM
 
 #include "lwip/apps/mqtt.h"      // Biblioteca LWIP MQTT -  fornece funções e recursos para conexão MQTT
 #include "lwip/apps/mqtt_priv.h" // Biblioteca que fornece funções e recursos para Geração de Conexões
 #include "lwip/dns.h"            // Biblioteca que fornece funções e recursos suporte DNS:
 #include "lwip/altcp_tls.h"      // Biblioteca que fornece funções e recursos para conexões seguras usando TLS:
 
+/* Arquivo de cabeçalho que contém as credenciais do MQTT e Wi-Fi
+ * Você deve criar este arquivo com as informações da sua rede Wi-Fi e do servidor MQTT.
+ * Exemplo:
+ * #ifndef ENV_H
+ * #define ENV_H
+ *
+ * #define WIFI_SSID "MinhaRede"
+ * #define WIFI_PASSWORD "MinhaSenha"
+ * #define MQTT_SERVER "MeuServidorMQTT"
+ * #define MQTT_USERNAME "MeuUsuarioMQTT"
+ * #define MQTT_PASSWORD "MeuPasswordMQTT"
+ *
+ * #endif
+ */
+#include "env.h"
+
+// Contudo, você também pode definir as credenciais diretamente aqui, mas isso não é recomendado por questões de segurança.
+// Se você não quiser usar um arquivo separado, comente o #include acima e defina as linhas abaixo:
+#ifndef ENV_H
 #define WIFI_SSID ""     // Substitua pelo nome da sua rede Wi-Fi
 #define WIFI_PASSWORD "" // Substitua pela senha da sua rede Wi-Fi
 #define MQTT_SERVER ""   // Substitua pelo endereço do host - broket MQTT: Ex: 192.168.1.107
 #define MQTT_USERNAME "" // Substitua pelo nome da host MQTT - Username
 #define MQTT_PASSWORD "" // Substitua pelo Password da host MQTT - credencial de acesso - caso exista
+#endif                   // ENV_H
 
 #define LED_GREEN_PIN 11 // GPIO11 - LED verde
 #define LED_BLUE_PIN 12  // GPIO12 - LED azul
 #define LED_RED_PIN 13   // GPIO13 - LED vermelho
+#define BUZZER_A 21      // GPIO21 - Buzzer
 
 // Definição dos pinos do joystick para simulação de umidade e qualidade do ar
 #define VRX 26
@@ -73,6 +95,13 @@ typedef struct
     uint16_t qualidade_do_ar; // Simulado pelo eixo X do joystick (0-100%)
 } SENSOR_DATA_T;
 
+// Structure for buzzer control
+typedef struct
+{
+    bool active;
+    uint32_t interval;
+} BUZZER_CONTROL_T;
+
 #ifndef DEBUG_printf
 #ifndef NDEBUG
 #define DEBUG_printf printf
@@ -117,6 +146,13 @@ typedef struct
 #define MQTT_UNIQUE_TOPIC 0
 #endif
 
+// Definições para controle do buzzer
+uint32_t last_buzzer_time = 0;
+bool buzzer_state = false;
+uint slice_buzzer;
+const float DIVIDER_PWM = 16.0;
+const uint16_t PERIOD = 4096;
+
 /* References for this implementation:
  * raspberry-pi-pico-c-sdk.pdf, Section '4.1.1. hardware_adc'
  * pico-examples/adc/adc_console/adc_console.c */
@@ -132,6 +168,12 @@ static void pub_request_cb(__unused void *arg, err_t err);
 
 // Topico MQTT
 static const char *full_topic(MQTT_CLIENT_DATA_T *state, const char *name);
+
+// Setup PWM
+static void setup_pwm(uint gpio, uint *slice, uint16_t level);
+
+// Controle do Buzzer
+static void control_buzzer(BUZZER_CONTROL_T *buzzer_control);
 
 // Controle do LED
 static void control_led(MQTT_CLIENT_DATA_T *state, bool on);
@@ -208,6 +250,8 @@ int main(void)
     gpio_init(LED_RED_PIN);
     gpio_set_dir(LED_RED_PIN, GPIO_OUT);
     gpio_put(LED_RED_PIN, false);
+
+    setup_pwm(BUZZER_A, &slice_buzzer, 0); // Configura o buzzer com PWM
 
     // Cria registro com os dados do cliente
     static MQTT_CLIENT_DATA_T state;
@@ -328,14 +372,41 @@ static float read_onboard_temperature(const char unit)
 static SENSOR_DATA_T read_joystick_sensors(void)
 {
     SENSOR_DATA_T sensorData;
+    BUZZER_CONTROL_T buzzerControl = {false, 0}; // Inicializa o controle do buzzer
 
-    // Lê eixo Y (nivel de umidade) - convertido para 0-100%
+    // --- Umidade relativa --- //
     adc_select_input(ADC_CHANNEL_1); // VRY
-    sensorData.umidade = (adc_read() * 100) / 4095;
+    uint16_t adc_umidade = adc_read();
+    // Converte para faixa realista: 30% - 70%
+    sensorData.umidade = 30 + ((adc_umidade * (70 - 30)) / 4095);
 
-    // Lê eixo X (volume de qualidade do ar) - convertido para ppm
+    // --- Qualidade do ar (CO2) --- //
     adc_select_input(ADC_CHANNEL_0); // VRX
-    sensorData.qualidade_do_ar = (adc_read() * 2000) / 4095;
+    uint16_t adc_co2 = adc_read();
+    // Converte para faixa realista: 350 ppm - 1200 ppm
+    sensorData.qualidade_do_ar = 350 + ((adc_co2 * (1200 - 350)) / 4095);
+
+    if (sensorData.umidade > 65 && sensorData.qualidade_do_ar > 1000)
+    {
+        buzzerControl.active = true;  // Ativa o buzzer se ambos os níveis estiverem altos
+        buzzerControl.interval = 200; // Intervalo de 200ms
+    }
+    else if (sensorData.qualidade_do_ar > 1000)
+    {
+        buzzerControl.active = true;  // Ativa o buzzer se a qualidade do ar for baixa
+        buzzerControl.interval = 300; // Intervalo de 300ms
+    }
+    else if (sensorData.umidade > 65 || sensorData.umidade < 35)
+    {
+        buzzerControl.active = true;  // Ativa o buzzer se a umidade for alta
+        buzzerControl.interval = 500; // Intervalo de 500ms
+    }
+    else
+    {
+        buzzerControl.active = false; // Desativa o buzzer se os níveis estiverem normais
+    }
+
+    control_buzzer(&buzzerControl); // Controla o buzzer com base no estado
 
     return sensorData;
 }
@@ -359,6 +430,42 @@ static const char *full_topic(MQTT_CLIENT_DATA_T *state, const char *name)
 #else
     return name;
 #endif
+}
+
+// PWM setup function (usada apenas para o buzzer)
+void setup_pwm(uint gpio, uint *slice, uint16_t level)
+{
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    *slice = pwm_gpio_to_slice_num(gpio);
+    pwm_set_clkdiv(*slice, DIVIDER_PWM);
+    pwm_set_wrap(*slice, PERIOD);
+    pwm_set_gpio_level(gpio, level);
+    pwm_set_enabled(*slice, true);
+}
+
+static void control_buzzer(BUZZER_CONTROL_T *buzzer_control)
+{
+    // Controla o buzzer com base no estado recebido
+    if (buzzer_control->active)
+    {
+        // Ativa o buzzer
+        uint32_t now = time_us_32();
+        if (now - last_buzzer_time >= buzzer_control->interval * 1000)
+        {
+            last_buzzer_time = now;
+            buzzer_state = !buzzer_state;
+            pwm_set_gpio_level(BUZZER_A, buzzer_state ? 300 : 0); // Define o nível do PWM para ativar/desativar o buzzer
+        }
+    }
+    else
+    {
+        // Desativa o buzzer
+        if (buzzer_state)
+        {
+            buzzer_state = false;
+            pwm_set_gpio_level(BUZZER_A, 0); // Define o nível do PWM para desativar o buzzer
+        }
+    }
 }
 
 // Controle do LED
