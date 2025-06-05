@@ -94,7 +94,7 @@ Este projeto demonstra como usar a **Raspberry Pi Pico W** como um cliente MQTT 
 ✨ **Contribuições são bem-vindas!** Sinta-se à vontade para abrir **issues** ou **pull requests**.  
 
 **Licença:** MIT  
-**Autor:** [Leonardo Rodrigues Luz]  
+**Autor:** Leonardo Rodrigues Luz  
 
 --- 
 
