@@ -100,5 +100,5 @@ Este projeto demonstra como usar a **Raspberry Pi Pico W** como um cliente MQTT 
 
 🔗 **Clone o repositório:**  
 ```bash
-git clone https://github.com/seu-usuario/SmartHouse-MQTT.git
+git clone https://github.com/Leo-Luz-code/SmartHouse-MQTT.git
 ```
